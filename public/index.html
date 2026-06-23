@@ -31,7 +31,7 @@
       </div>
       <span class="logo-name">Hear<span>Check</span></span>
     </div>
-    <span class="header-badge">AI 스크리닝</span>
+    <span class="header-badge">오프라인 분석</span>
   </header>
 
   <!-- ── Nav Tabs ─────────────────────────────────── -->
@@ -223,14 +223,18 @@
       <div class="card">
         <p class="card-title">
           <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-1px;margin-right:4px" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/></svg>
-          Claude AI 청각 분석
+          청각 분석 리포트 (학술 알고리즘)
         </p>
-        <div class="ai-output" id="ai-output" aria-live="polite">AI 분석을 실행하면 결과가 여기에 표시됩니다.</div>
+        <div class="ai-output" id="ai-output" aria-live="polite">학술 알고리즘 기반 분석 결과가 여기에 표시됩니다.
+
+사용 알고리즘: WHO 2021 청력분류 · NAL-R 처방공식(Byrne &amp; Dillon 1986) · ANSI S3.5 어음명료도 지수 · Schuknecht 패턴분류</div>
       </div>
 
       <div class="card">
         <p class="card-title">DNN-HA 보정 시뮬레이션</p>
-        <div class="ai-output" id="dnn-output" aria-live="polite" style="min-height:60px">AI 분석 실행 후 DNN 보정 결과가 표시됩니다.</div>
+        <div class="ai-output" id="dnn-output" aria-live="polite" style="min-height:60px">DNN-HA 이득 처방 결과가 여기에 표시됩니다.
+
+참고: Kim et al. (2023) Applied Sciences 13(4):2580 알고리즘 기반</div>
       </div>
     </section>
 
@@ -244,6 +248,7 @@
   </div>
 
 </div><!-- /app -->
+<script src="/analysis-engine.js"></script>
 <script src="/app.js" defer></script>
 </body>
 </html>

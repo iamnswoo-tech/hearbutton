@@ -1,5 +1,5 @@
-const CACHE = 'hearcheck-v1';
-const ASSETS = ['/', '/index.html', '/app.js', '/style.css', '/manifest.json'];
+const CACHE = 'hearcheck-v2';
+const ASSETS = ['/', '/index.html', '/app.js', '/analysis-engine.js', '/style.css', '/manifest.json'];
 
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS)));
