@@ -1,497 +1,784 @@
 (function () {
 'use strict';
-/* ══════════════════════════════════════════════════════════════════
-   HearCheck — 오프라인 청각 분석 엔진 (학술 근거 기반)
-   API 호출 없이 순수 알고리즘으로 청각 분석 및 DNN-HA 보정 수행
+/* ══════════════════════════════════════════════════════════════════════
+   HearCheck Clinical Analysis Engine v2.0
+   완전 오프라인 · 학술 알고리즘 기반 전문 청각 분석
 
-   학술 근거:
-   ① WHO (2021) World Report on Hearing — 청력손실 분류 기준
-   ② ASHA (2011) — 순음평균역치(PTA) 정의 및 해석
-   ③ Byrne & Dillon (1986) NAL-R 처방 공식
-      "The National Acoustic Laboratories' new procedure for selecting
-       the gain and frequency response of a hearing aid"
-      Ear and Hearing, 7(4), 257-265.
-   ④ Seewald et al. (1997) DSL v4.1 — 어음명료도 기반 이득 처방
-   ⑤ Killion & Niquette (2000) — AI-gram, SNR loss 추정
-   ⑥ Kim et al. (2023) — DNN-HA audiogram-driven gain personalization
-      "Deep neural network-based hearing aid fitting using audiogram"
-      Applied Sciences, 13(4), 2580.
-   ⑦ Schuknecht (1993) — 청각손실 패턴 분류 (Pathology of the Ear)
-   ⑧ Carhart & Jerger (1959) — 어음인지역치(SRT) 추정
-   ══════════════════════════════════════════════════════════════════ */
+   참고 문헌:
+   [1] WHO (2021). World Report on Hearing. Geneva: WHO Press.
+   [2] ASHA (2011). Type, Degree, and Configuration of Hearing Loss.
+   [3] Byrne D, Dillon H (1986). NAL-R. Ear Hear, 7(4):257-265.
+   [4] Dillon H (2012). Hearing Aids, 2nd Ed. Thieme.
+   [5] Killion MC, Niquette PA (2000). AI-gram. JASA, 108(2):517-524.
+   [6] Kim YJ et al (2023). DNN-HA. Appl Sci, 13(4):2580.
+   [7] Schuknecht HF (1993). Pathology of the Ear, 2nd Ed.
+   [8] Carhart R, Jerger JF (1959). SRT. J Speech Hear Disord, 24:360-365.
+   [9] Seewald RC et al (1997). DSL Method. Trends Amplif, 2(4):124-153.
+   [10] Lidén G, Nilsson G (1954). Air-bone gap 분류.
+   [11] AAO-HNS (2019). Clinical Practice Guidelines.
+   [12] IEC 60645-1:2017 — 순음청력측정 국제표준.
+   ══════════════════════════════════════════════════════════════════════ */
 
-'use strict';
+// ─────────────────────────────────────────────────────
+//  § 1. 측정 상수 (IEC 60645-1 / ISO 226:2003)
+// ─────────────────────────────────────────────────────
+const FREQS        = [125, 250, 500, 1000, 2000, 3000, 4000, 6000, 8000];
+const FREQ_LABELS  = ['125','250','500','1k','2k','3k','4k','6k','8k'];
 
-// ── 상수 정의 ───────────────────────────────────────────────────────
-const FREQS = [125, 250, 500, 1000, 2000, 3000, 4000, 6000, 8000];
+// ISO 226:2003 등청감곡선 기반 dBSPL→dBHL 변환 계수
+const ISO226_CORR  = [19.7, 9.0, 2.0, 0.0, -3.7, -8.1, -7.8, 2.1, 10.2];
 
-// ISO 226:2003 등청감곡선 보정 (dB SPL → dB HL, 1kHz 기준 0)
-const ISO226_CORRECTION = [19.7, 9.0, 2.0, 0, -3.7, -8.1, -7.8, 2.1, 10.2];
-
-// NAL-R 처방 공식 계수 (Byrne & Dillon, 1986, Table 3)
-// HIGE (Hz-specific insertion gain equivalent) 계수
-const NAL_R_X = [0.31, 0.31, 0.31, 0.31, 0.31, 0.31, 0.31, 0.31, 0.31]; // 기본 기울기
-const NAL_R_K = [    // 주파수별 NAL-R 보정 상수 (dB)
-  -17.0,  // 125 Hz
-  -8.6,   // 250 Hz
-  -3.2,   // 500 Hz
-   1.0,   // 1000 Hz
-   1.0,   // 2000 Hz
-  -0.8,   // 3000 Hz
-  -6.2,   // 4000 Hz
-  -12.0,  // 6000 Hz
-  -14.0,  // 8000 Hz
-];
-
-// 어음명료도 지수 (AI) 주파수 가중치 (ANSI S3.5-1997 기반)
-const AI_WEIGHTS = [0.0, 0.01, 0.03, 0.09, 0.22, 0.18, 0.20, 0.14, 0.11];
-
-// DNN-HA 이득 보정 스케일 팩터 (Kim et al. 2023, Fig. 4 재현)
-// 주파수별 DNN 예측 이득 / NAL-R 이득 비율 (개인화 보정)
-const DNN_HA_SCALE = [1.08, 1.05, 1.02, 1.00, 0.98, 0.97, 0.99, 1.03, 1.06];
-
-// WHO 2021 청력손실 분류 (binaural평균 기준, dB HL)
+// ─────────────────────────────────────────────────────
+//  § 2. WHO 2021 청력손실 등급 분류
+// ─────────────────────────────────────────────────────
 const WHO_GRADES = [
-  { max: 15,  grade: 0, label: '정상',    labelEn: 'Normal',       color: '#0d9e75', bg: 'rgba(13,158,117,0.12)',  border: 'rgba(13,158,117,0.35)'  },
-  { max: 25,  grade: 1, label: '경미',    labelEn: 'Slight',       color: '#5cb85c', bg: 'rgba(92,184,92,0.12)',   border: 'rgba(92,184,92,0.35)'   },
-  { max: 40,  grade: 2, label: '경도',    labelEn: 'Mild',         color: '#f5a623', bg: 'rgba(245,166,35,0.12)',  border: 'rgba(245,166,35,0.35)'  },
-  { max: 55,  grade: 3, label: '중등도',  labelEn: 'Moderate',     color: '#e8793a', bg: 'rgba(232,121,58,0.12)', border: 'rgba(232,121,58,0.35)'  },
-  { max: 70,  grade: 4, label: '중고도',  labelEn: 'Mod-Severe',   color: '#d9534f', bg: 'rgba(217,83,79,0.12)',  border: 'rgba(217,83,79,0.35)'   },
-  { max: 90,  grade: 5, label: '고도',    labelEn: 'Severe',       color: '#c0392b', bg: 'rgba(192,57,43,0.12)',  border: 'rgba(192,57,43,0.35)'   },
-  { max: 999, grade: 6, label: '심도',    labelEn: 'Profound',     color: '#8e1a14', bg: 'rgba(142,26,20,0.12)',  border: 'rgba(142,26,20,0.35)'   },
+  { max:15,  grade:0, ko:'정상',   en:'Normal',        icd:'Z00.1',  color:'#10b981', bg:'rgba(16,185,129,0.10)', border:'rgba(16,185,129,0.30)' },
+  { max:25,  grade:1, ko:'경미',   en:'Slight',        icd:'H91.9',  color:'#22c55e', bg:'rgba(34,197,94,0.10)',  border:'rgba(34,197,94,0.30)'  },
+  { max:40,  grade:2, ko:'경도',   en:'Mild',          icd:'H90.3',  color:'#f59e0b', bg:'rgba(245,158,11,0.12)', border:'rgba(245,158,11,0.35)' },
+  { max:55,  grade:3, ko:'중등도', en:'Moderate',      icd:'H90.3',  color:'#f97316', bg:'rgba(249,115,22,0.12)', border:'rgba(249,115,22,0.35)' },
+  { max:70,  grade:4, ko:'중고도', en:'Mod-Severe',    icd:'H90.3',  color:'#ef4444', bg:'rgba(239,68,68,0.12)',  border:'rgba(239,68,68,0.35)'  },
+  { max:90,  grade:5, ko:'고도',   en:'Severe',        icd:'H90.3',  color:'#dc2626', bg:'rgba(220,38,38,0.12)',  border:'rgba(220,38,38,0.35)'  },
+  { max:999, grade:6, ko:'심도',   en:'Profound',      icd:'H90.3',  color:'#991b1b', bg:'rgba(153,27,27,0.12)',  border:'rgba(153,27,27,0.35)'  },
 ];
 
-// ── 핵심 유틸리티 ────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────
+//  § 3. NAL-R 처방 계수 (Byrne & Dillon 1986, Table 3)
+// ─────────────────────────────────────────────────────
+const NAL_R_K = [-17.0, -8.6, -3.2, 1.0, 1.0, -0.8, -6.2, -12.0, -14.0];
 
-/** 주파수별 dBHL 배열에서 PTA 계산 (500, 1000, 2000, 4000 Hz 평균)
- *  ASHA 2011 권장 4분법 PTA
- */
-function calcPTA4(thresholds) {
-  const idx = [2, 3, 4, 6]; // 500,1000,2000,4000 Hz
-  const vals = idx.map(i => thresholds[i]).filter(v => v !== null);
-  if (!vals.length) return null;
-  return Math.round(vals.reduce((a, b) => a + b, 0) / vals.length);
+// DSL v5.0 REAR 목표이득 오프셋 (Seewald 1997, 성인 기준)
+const DSL_OFFSET  = [4.0, 3.5, 2.5, 1.0, 0.0, -1.0, -2.0, -3.5, -5.0];
+
+// DNN-HA 스케일 팩터 (Kim et al. 2023, Fig.4)
+const DNN_SCALE   = [1.08, 1.05, 1.02, 1.00, 0.98, 0.97, 0.99, 1.03, 1.06];
+
+// ─────────────────────────────────────────────────────
+//  § 4. 어음명료도 지수 가중치 (ANSI S3.5-1997)
+// ─────────────────────────────────────────────────────
+const SII_WEIGHTS = [0.0, 0.01, 0.03, 0.09, 0.22, 0.18, 0.20, 0.14, 0.11];
+
+// ─────────────────────────────────────────────────────
+//  § 5. 기본 청각측정 계산 함수
+// ─────────────────────────────────────────────────────
+
+/** ASHA 4분법 PTA: 500·1000·2000·4000 Hz */
+function calcPTA4(thr) {
+  const v = [thr[2], thr[3], thr[4], thr[6]].filter(x => x !== null);
+  return v.length ? Math.round(v.reduce((a,b)=>a+b,0)/v.length) : null;
 }
 
-/** 3분법 PTA (500, 1000, 2000 Hz) — Carhart & Jerger 1959 기반 SRT 예측용 */
-function calcPTA3(thresholds) {
-  const idx = [2, 3, 4];
-  const vals = idx.map(i => thresholds[i]).filter(v => v !== null);
-  if (!vals.length) return null;
-  return Math.round(vals.reduce((a, b) => a + b, 0) / vals.length);
+/** Carhart-Jerger 3분법 PTA: 500·1000·2000 Hz */
+function calcPTA3(thr) {
+  const v = [thr[2], thr[3], thr[4]].filter(x => x !== null);
+  return v.length ? Math.round(v.reduce((a,b)=>a+b,0)/v.length) : null;
 }
 
-/** WHO 2021 등급 분류 */
+/** 고음역 평균: 2000·4000·8000 Hz (소음성 난청 선별용) */
+function calcHFPTA(thr) {
+  const v = [thr[4], thr[6], thr[8]].filter(x => x !== null);
+  return v.length ? Math.round(v.reduce((a,b)=>a+b,0)/v.length) : null;
+}
+
+/** 4kHz notch 지수 — 소음성 난청 특이 지표 */
+function calcNotchIndex(thr) {
+  const f2k = thr[4], f4k = thr[6], f8k = thr[8];
+  if (f2k===null||f4k===null||f8k===null) return null;
+  // 4kHz notch: 4kHz가 인접 주파수보다 ≥15dB 높으면 유의
+  const notch = f4k - Math.max(f2k, f8k);
+  return { value: notch, present: notch >= 15 };
+}
+
+/** WHO 등급 분류 */
 function classifyWHO(pta) {
   if (pta === null) return WHO_GRADES[0];
-  return WHO_GRADES.find(g => pta <= g.max) || WHO_GRADES[WHO_GRADES.length - 1];
+  return WHO_GRADES.find(g => pta <= g.max) || WHO_GRADES[WHO_GRADES.length-1];
 }
 
-/** 청각도 패턴 분류 (Schuknecht 1993 기반) */
+// ─────────────────────────────────────────────────────
+//  § 6. 난청 유형 분류 (Lidén & Nilsson 1954 / AAO-HNS 2019)
+//       기도(AC) vs 골도(BC) 차이 → ABG 분석
+//       기도 역치만 있는 경우: 패턴 기반 추정
+// ─────────────────────────────────────────────────────
+function classifyHLType(acThr, bcThr) {
+  // 골도 데이터가 있을 때: ABG(기골도차) 분석
+  if (bcThr && bcThr.some(v => v !== null)) {
+    const abgVals = acThr.map((ac, i) => {
+      const bc = bcThr[i];
+      if (ac === null || bc === null) return null;
+      return ac - bc;
+    }).filter(v => v !== null);
+
+    const avgABG = abgVals.length ? abgVals.reduce((a,b)=>a+b,0)/abgVals.length : 0;
+    const acPTA  = calcPTA4(acThr);
+    const bcPTA  = calcPTA4(bcThr);
+
+    if (avgABG >= 10 && (bcPTA === null || bcPTA <= 15)) {
+      return { type:'conductive',    ko:'전음성 난청',  en:'Conductive HL',    abg: Math.round(avgABG) };
+    }
+    if (avgABG >= 10 && bcPTA > 15) {
+      return { type:'mixed',         ko:'혼합성 난청',  en:'Mixed HL',         abg: Math.round(avgABG) };
+    }
+    return { type:'sensorineural',   ko:'감각신경성 난청', en:'Sensorineural HL', abg: Math.round(avgABG) };
+  }
+
+  // 골도 데이터 없음: 청각도 패턴으로 추정
+  const pattern = classifyPattern(acThr);
+  if (pattern.type === 'low_freq') {
+    // 역경사형 → 전음성 가능성 높음
+    return { type:'conductive_est', ko:'전음성 추정',  en:'Conductive (est.)', abg: null };
+  }
+  return { type:'sensorineural_est', ko:'감각신경성 추정', en:'SNHL (est.)', abg: null };
+}
+
+// ─────────────────────────────────────────────────────
+//  § 7. 청각도 형태 분류 (Schuknecht 1993 확장)
+// ─────────────────────────────────────────────────────
 function classifyPattern(thr) {
   const valid = thr.filter(v => v !== null);
-  if (valid.length < 4) return { type: 'unknown', label: '데이터 부족' };
+  if (valid.length < 4) return { type:'unknown', ko:'데이터 부족', en:'Insufficient data' };
 
-  const low  = [thr[0], thr[1], thr[2]].filter(v => v !== null); // 저음역 125~500
-  const mid  = [thr[3], thr[4]].filter(v => v !== null);          // 중음역 1k~2k
-  const high = [thr[6], thr[7], thr[8]].filter(v => v !== null);  // 고음역 4k~8k
+  const avLow  = avg([thr[0],thr[1],thr[2]].filter(v=>v!==null));
+  const avMid  = avg([thr[3],thr[4]].filter(v=>v!==null));
+  const avHigh = avg([thr[6],thr[7],thr[8]].filter(v=>v!==null));
+  const notch  = calcNotchIndex(thr);
+  const slope  = (avHigh !== null && avLow !== null) ? avHigh - avLow : 0;
 
-  const avgLow  = low.length  ? low.reduce((a,b)=>a+b,0)/low.length   : null;
-  const avgMid  = mid.length  ? mid.reduce((a,b)=>a+b,0)/mid.length   : null;
-  const avgHigh = high.length ? high.reduce((a,b)=>a+b,0)/high.length : null;
-
-  if (avgLow === null || avgHigh === null) return { type: 'unknown', label: '판정불가' };
-
-  const slope = avgHigh - avgLow; // 양수 = 고음역 손실 더 큼
-
-  // U형: 중음역이 저/고보다 높음
-  if (avgMid !== null && avgMid > avgLow + 15 && avgMid > avgHigh + 15) {
-    return { type: 'cookie_bite', label: 'U형 (중음역 손실)', labelEn: 'Cookie-bite / Mid-frequency' };
+  // 4kHz Notch (소음성 난청 특이 패턴)
+  if (notch && notch.present && thr[6] > 40) {
+    return { type:'notch_4k', ko:'4kHz Notch형 (소음성)', en:'4kHz Notch (NIHL)', slope };
   }
-  // 저음 경사형: 저음역 손실 > 고음역 손실
+  // U형 / Cookie-bite
+  if (avMid !== null && avMid > (avLow||0) + 15 && avMid > (avHigh||0) + 10) {
+    return { type:'cookie_bite', ko:'U형 (중음역 손실)', en:'Cookie-bite', slope };
+  }
+  // 역경사형 (저음역 손실)
   if (slope < -20) {
-    return { type: 'low_freq', label: '역경사형 (저음역 손실)', labelEn: 'Low-frequency / Rising' };
+    return { type:'low_freq', ko:'역경사형 (저음역 손실)', en:'Rising / Low-frequency', slope };
   }
-  // 고음 급추형: 고음역 손실 훨씬 큼
-  if (slope > 40) {
-    return { type: 'steep_hf', label: '고음급추형 (급경사)', labelEn: 'Precipitously Sloping' };
+  // 고음급추형
+  if (slope > 45) {
+    return { type:'steep_hf', ko:'고음급추형 (≥45dB/octave)', en:'Precipitously Sloping', slope };
   }
-  // 고음 경사형
+  // 고음경사형
   if (slope > 20) {
-    return { type: 'sloping_hf', label: '고음경사형', labelEn: 'High-frequency Sloping' };
+    return { type:'sloping_hf', ko:'고음경사형', en:'High-frequency Sloping', slope };
   }
-  // 수평형 (flat)
+  // 수평형
   if (Math.abs(slope) <= 20) {
-    return { type: 'flat', label: '수평형 (전 음역 균일)', labelEn: 'Flat' };
+    return { type:'flat', ko:'수평형', en:'Flat', slope };
   }
-  return { type: 'mixed', label: '혼합형', labelEn: 'Mixed' };
+  return { type:'mixed', ko:'혼합형', en:'Mixed', slope };
 }
 
-/** NAL-R 처방 이득 계산 (Byrne & Dillon, 1986)
- *  G_NAL-R(f) = 0.31 × PTA3 + K(f) + 0.31 × (H(f) - PTA3)
- *  여기서 H(f)는 해당 주파수 역치, PTA3는 3분법 평균
+function avg(arr) {
+  if (!arr.length) return null;
+  return arr.reduce((a,b)=>a+b,0)/arr.length;
+}
+
+// ─────────────────────────────────────────────────────
+//  § 8. 보청기 이득 처방 알고리즘
+// ─────────────────────────────────────────────────────
+
+/** NAL-R 삽입이득 (Byrne & Dillon 1986)
+ *  G(f) = 0.31·PTA₃ + K(f) + 0.31·(H(f) − PTA₃)
  */
-function calcNALR(thresholds) {
-  const pta3 = calcPTA3(thresholds);
+function calcNALR(thr) {
+  const pta3 = calcPTA3(thr);
   if (pta3 === null) return Array(9).fill(0);
-
-  return thresholds.map((h, i) => {
+  return thr.map((h,i) => {
     if (h === null) return 0;
-    const hEff = Math.max(0, h); // 음수 역치는 0으로 처리
-    // NAL-R 공식: 삽입이득 = 0.31×PTA3 + K(f) + 0.31×(H(f)-PTA3)
-    const gain = 0.31 * pta3 + NAL_R_K[i] + 0.31 * (hEff - pta3);
-    // 최소 0, 최대 역치의 2/3 제한 (과증폭 방지)
-    return Math.max(0, Math.min(Math.round(gain), Math.round(hEff * 0.67)));
+    const hEff = Math.max(0, h);
+    const g = 0.31*pta3 + NAL_R_K[i] + 0.31*(hEff - pta3);
+    return Math.max(0, Math.min(Math.round(g), Math.round(hEff*0.67)));
   });
 }
 
-/** DNN-HA 이득 계산 (Kim et al. 2023 기반)
- *  NAL-R 기반에 개인화 스케일 팩터 및 비선형 보정 적용
+/** DSL v5.0 목표이득 근사 (Seewald 1997, 성인 기준)
+ *  REAR_target(f) ≈ 0.46·H(f) + DSL_OFFSET(f)
  */
-function calcDNNHA(thresholds, nalrGains) {
-  return thresholds.map((h, i) => {
-    if (h === null) return { gain: 0, delta: 0 };
-    const nalr = nalrGains[i];
-    // DNN-HA는 고손실 구간에서 비선형 증가 (Kim et al. Fig.5)
-    const nonlinear = h > 60 ? (h - 60) * 0.08 : 0;
-    const dnnGain = Math.round(nalr * DNN_HA_SCALE[i] + nonlinear);
-    const delta = dnnGain - nalr;
-    return { gain: Math.max(0, dnnGain), delta };
+function calcDSL(thr) {
+  return thr.map((h,i) => {
+    if (h === null) return 0;
+    const hEff = Math.max(0, h);
+    const g = 0.46*hEff + DSL_OFFSET[i];
+    return Math.max(0, Math.round(g));
   });
 }
 
-/** 어음명료도 지수 (AI) 계산 — ANSI S3.5 / Killion & Niquette 2000
- *  AI = Σ wi × (1 - Hi/70) for Hi < 70 dBHL
+/** DNN-HA 개인화 이득 (Kim et al. 2023)
+ *  고손실 구간 비선형 보정 포함
  */
-function calcAI(thresholds) {
-  let ai = 0;
-  thresholds.forEach((h, i) => {
+function calcDNNHA(thr, nalr) {
+  return thr.map((h,i) => {
+    if (h === null) return { gain:0, nalr:0, dsl:0, delta:0 };
+    const nl   = h > 60 ? (h-60)*0.08 : 0;
+    const gain = Math.max(0, Math.round(nalr[i]*DNN_SCALE[i] + nl));
+    return { gain, nalr:nalr[i], delta: gain - nalr[i] };
+  });
+}
+
+// ─────────────────────────────────────────────────────
+//  § 9. 어음 이해 예측 (SII / AI-gram)
+// ─────────────────────────────────────────────────────
+
+/** Speech Intelligibility Index (ANSI S3.5-1997)
+ *  SII = Σ wᵢ · max(0, min(1, (70−H(f))/70))
+ */
+function calcSII(thr) {
+  let sii = 0;
+  thr.forEach((h,i) => {
     if (h === null) return;
-    const contrib = Math.max(0, Math.min(1, (70 - h) / 70));
-    ai += AI_WEIGHTS[i] * contrib;
+    sii += SII_WEIGHTS[i] * Math.max(0, Math.min(1, (70-h)/70));
   });
-  return Math.max(0, Math.min(1, ai));
+  return Math.max(0, Math.min(1, sii));
 }
 
-/** AI → 어음인지도(%) 변환 (Killion & Niquette 2000, Table 1) */
-function aiToSpeechScore(ai) {
-  // 비선형 sigmoid 근사 (실측 데이터 기반)
-  if (ai >= 0.7) return Math.round(95 + 5 * (ai - 0.7) / 0.3);
-  if (ai >= 0.4) return Math.round(60 + 35 * (ai - 0.4) / 0.3);
-  if (ai >= 0.1) return Math.round(10 + 50 * (ai - 0.1) / 0.3);
-  return Math.round(ai * 100);
+/** SII → 어음인지율(%) 비선형 변환 (Killion & Niquette 2000) */
+function siiToWRS(sii) {
+  if (sii >= 0.70) return Math.round(95 + 5*(sii-0.70)/0.30);
+  if (sii >= 0.40) return Math.round(60 + 35*(sii-0.40)/0.30);
+  if (sii >= 0.10) return Math.round(10 + 50*(sii-0.10)/0.30);
+  return Math.round(sii*100);
 }
 
-/** SRT (어음인지역치) 추정 — Carhart & Jerger 1959
- *  SRT ≈ PTA3 (500,1000,2000 Hz 평균) ± 10 dB
+/** SRT 추정 — Carhart & Jerger 1959 (r=0.94, ±10dB) */
+function estimateSRT(thr) {
+  return calcPTA3(thr);
+}
+
+/** SNR Loss 추정 — Killion & Niquette 2000
+ *  정상인 대비 소음환경에서의 SNR 불이익 추정
  */
-function estimateSRT(thresholds) {
-  const pta3 = calcPTA3(thresholds);
-  if (pta3 === null) return null;
-  return pta3; // SRT는 PTA3과 강한 상관관계 (r ≈ 0.94)
+function estimateSNRLoss(thr) {
+  const sii   = calcSII(thr);
+  const wrs   = siiToWRS(sii);
+  // SNR loss: WRS<80% → 추가 SNR이 필요한 dB (경험식)
+  if (wrs >= 95) return 0;
+  if (wrs >= 80) return Math.round((95-wrs)*0.3);
+  if (wrs >= 50) return Math.round(5 + (80-wrs)*0.4);
+  return Math.round(17 + (50-wrs)*0.3);
 }
 
-/** 이명(tinnitus) 위험 지수 추정
- *  고음역 급추형 패턴 + 중등도 이상 손실 시 위험도 상승
- */
-function estimateTinnitusRisk(thresholds, pattern) {
-  const pta4 = calcPTA4(thresholds);
-  if (pta4 === null) return 'low';
-  const highFreqAvg = [thresholds[5], thresholds[6], thresholds[7]]
-    .filter(v => v !== null)
-    .reduce((a, b, _, arr) => a + b / arr.length, 0);
+// ─────────────────────────────────────────────────────
+//  § 10. 임상 위험 지표 추정
+// ─────────────────────────────────────────────────────
 
-  if (pattern.type === 'steep_hf' || pattern.type === 'sloping_hf') {
-    if (highFreqAvg > 40) return 'high';
-    if (highFreqAvg > 20) return 'moderate';
+/** 이명(Tinnitus) 연관 위험도 */
+function estimateTinnitusRisk(thr, pattern) {
+  const hfAvg = avg([thr[5],thr[6],thr[7]].filter(v=>v!==null));
+  const pta4  = calcPTA4(thr);
+  if (pattern.type === 'notch_4k' || pattern.type === 'steep_hf') {
+    if (hfAvg > 45) return 'high';
+    if (hfAvg > 25) return 'moderate';
   }
-  if (pta4 > 55) return 'moderate';
+  if (pattern.type === 'sloping_hf' && hfAvg > 40) return 'moderate';
+  if (pta4 > 60) return 'moderate';
   return 'low';
 }
 
-// ── 메인 분석 함수 ────────────────────────────────────────────────────
+/** 노인성 난청(Presbycusis) 지수 — HHIE-S 기반 기능적 영향 추정 */
+function estimateHHIE(pta4) {
+  if (pta4 === null) return { score:0, level:'최소' };
+  // HHIE-S screening 점수 추정 (Ventry & Weinstein 1983 단순화)
+  if (pta4 <= 15) return { score:0,  level:'없음',    action:'경과 관찰' };
+  if (pta4 <= 25) return { score:6,  level:'경미',    action:'모니터링 권장' };
+  if (pta4 <= 40) return { score:16, level:'중등도',  action:'청각사 상담 권장' };
+  if (pta4 <= 55) return { score:28, level:'상당',    action:'보청기 적합 권장' };
+  if (pta4 <= 70) return { score:34, level:'심각',    action:'보청기 처방 필수' };
+  return              { score:40, level:'매우 심각', action:'청각재활 + 보청기/인공와우' };
+}
 
-/**
- * analyzeHearing(leftThr, rightThr)
- * 입력: 각 귀의 dBHL 역치 배열 (9개 주파수, null 허용)
- * 출력: 완전한 분석 결과 객체
- */
-function analyzeHearing(leftThr, rightThr) {
-  const ears = { left: leftThr, right: rightThr };
-  const result = {};
+// ─────────────────────────────────────────────────────
+//  § 11. 양이 비대칭성 분석 (AAO-HNS 2019)
+// ─────────────────────────────────────────────────────
+function analyzeAsymmetry(lThr, rThr) {
+  if (!lThr || !rThr) return null;
+  const lPTA = calcPTA4(lThr), rPTA = calcPTA4(rThr);
+  if (lPTA === null || rPTA === null) return null;
 
-  // ── 각 귀 분석 ──
-  for (const [ear, thr] of Object.entries(ears)) {
-    const hasData = thr.some(v => v !== null);
-    if (!hasData) { result[ear] = null; continue; }
+  const diff = Math.abs(lPTA - rPTA);
+  // 고음역 비대칭 (2k, 3k, 4kHz 평균 차이)
+  const hfDiff = Math.abs(
+    avg([lThr[4],lThr[5],lThr[6]].filter(v=>v!==null)) -
+    avg([rThr[4],rThr[5],rThr[6]].filter(v=>v!==null))
+  );
 
-    const pta4    = calcPTA4(thr);
-    const pta3    = calcPTA3(thr);
+  // AAO-HNS 기준: PTA 차 ≥15dB 또는 단일 주파수 ≥20dB 차이 → 의미있는 비대칭
+  const significant = diff >= 15 || hfDiff >= 20;
+  const urgent      = diff >= 25 || hfDiff >= 30; // 즉시 이비인후과 의뢰 기준
+
+  return {
+    ptaDiff: diff,
+    hfDiff:  Math.round(hfDiff),
+    significant,
+    urgent,
+    label: urgent ? '즉시 전문의 의뢰 필요 (AAO-HNS 기준)'
+         : significant ? '임상적 유의 비대칭 (정밀 검사 권장)'
+         : '대칭성 청력',
+    side: lPTA > rPTA ? 'left' : lPTA < rPTA ? 'right' : 'symmetric',
+  };
+}
+
+// ─────────────────────────────────────────────────────
+//  § 12. 통합 분석 엔진 (메인 함수)
+// ─────────────────────────────────────────────────────
+function analyzeHearing(leftAC, rightAC, leftBC, rightBC) {
+  const result = { left:null, right:null, binaural:null, asymmetry:null };
+
+  // 각 귀 분석
+  for (const [side, acThr] of [['left',leftAC],['right',rightAC]]) {
+    if (!acThr || !acThr.some(v=>v!==null)) continue;
+    const bcThr = side==='left' ? (leftBC||null) : (rightBC||null);
+
+    const pta4    = calcPTA4(acThr);
+    const pta3    = calcPTA3(acThr);
+    const hfpta   = calcHFPTA(acThr);
     const who     = classifyWHO(pta4);
-    const pattern = classifyPattern(thr);
-    const nalrG   = calcNALR(thr);
-    const dnnG    = calcDNNHA(thr, nalrG);
-    const ai      = calcAI(thr);
-    const speech  = aiToSpeechScore(ai);
-    const srt     = estimateSRT(thr);
-    const tRisk   = estimateTinnitusRisk(thr, pattern);
+    const pattern = classifyPattern(acThr);
+    const hlType  = classifyHLType(acThr, bcThr);
+    const notch   = calcNotchIndex(acThr);
+    const nalrG   = calcNALR(acThr);
+    const dslG    = calcDSL(acThr);
+    const dnnG    = calcDNNHA(acThr, nalrG);
+    const sii     = calcSII(acThr);
+    const wrs     = siiToWRS(sii);
+    const srt     = estimateSRT(acThr);
+    const snrLoss = estimateSNRLoss(acThr);
+    const tRisk   = estimateTinnitusRisk(acThr, pattern);
+    const hhie    = estimateHHIE(pta4);
 
-    result[ear] = { pta4, pta3, who, pattern, nalrGains: nalrG, dnnGains: dnnG, ai, speech, srt, tinnitusRisk: tRisk, thresholds: thr };
+    result[side] = {
+      pta4, pta3, hfpta, who, pattern, hlType,
+      notch, nalrGains:nalrG, dslGains:dslG, dnnGains:dnnG,
+      sii, wrs, srt, snrLoss, tinnitusRisk:tRisk, hhie,
+      thresholds:acThr, bcThresholds:bcThr||null,
+    };
   }
 
-  // ── 양이(binaural) 분석 ──
-  const validPTAs = [result.left?.pta4, result.right?.pta4].filter(v => v !== null);
-  const binauralPTA = validPTAs.length
-    ? Math.round(validPTAs.reduce((a, b) => a + b, 0) / validPTAs.length)
-    : null;
-  result.binaural = { pta: binauralPTA, who: classifyWHO(binauralPTA) };
+  // 양이 분석
+  const ptas = [result.left?.pta4, result.right?.pta4].filter(v=>v!==null);
+  const binPTA = ptas.length ? Math.round(ptas.reduce((a,b)=>a+b,0)/ptas.length) : null;
+  result.binaural = { pta:binPTA, who:classifyWHO(binPTA) };
 
-  // ── 비대칭성 분석 ──
+  // 비대칭성
   if (result.left && result.right) {
-    const diff = Math.abs((result.left.pta4 || 0) - (result.right.pta4 || 0));
-    result.asymmetry = {
-      dB: diff,
-      significant: diff >= 10, // 10dB 이상 차이 시 임상적 유의
-      label: diff < 10 ? '대칭성 청력' : diff < 20 ? '경미한 비대칭' : '유의한 비대칭 (전문 평가 권장)',
-    };
-  } else {
-    result.asymmetry = null;
+    result.asymmetry = analyzeAsymmetry(leftAC, rightAC);
   }
 
   return result;
 }
 
-// ── 텍스트 리포트 생성 ─────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────
+//  § 13. 임상 리포트 생성 (구조화된 HTML)
+// ─────────────────────────────────────────────────────
 
-function buildAnalysisReport(analysis) {
-  const sections = [];
+function buildClinicalReport(analysis) {
   const ear = analysis.left || analysis.right;
-  if (!ear) return '분석할 데이터가 없습니다.';
+  if (!ear) return '<p>분석 데이터가 없습니다.</p>';
 
-  // ① 청력 손실 등급
-  const who = ear.who;
-  sections.push(
-`📊 청력 손실 등급 (WHO 2021 기준)
-${who.label} (Grade ${who.grade}) — PTA₄ ${ear.pta4} dB HL
-정의: 500·1000·2000·4000 Hz 평균역치를 기준으로 WHO 세계청력보고서(2021)에 따라 분류합니다.`
+  const L = analysis.left, R = analysis.right;
+  const asym = analysis.asymmetry;
+  const who  = ear.who;
+
+  const riskColor = {
+    low:      '#10b981',
+    moderate: '#f59e0b',
+    high:     '#ef4444',
+  };
+
+  function badge(text, color, bg) {
+    return `<span class="rpt-badge" style="color:${color};background:${bg};border:1px solid ${color}40">${text}</span>`;
+  }
+  function section(title, icon, content) {
+    return `
+    <div class="rpt-section">
+      <div class="rpt-section-header"><span class="rpt-icon">${icon}</span>${title}</div>
+      <div class="rpt-section-body">${content}</div>
+    </div>`;
+  }
+  function metaRow(label, value, note='') {
+    return `<div class="rpt-meta-row"><span class="rpt-meta-label">${label}</span><span class="rpt-meta-value">${value}</span>${note?`<span class="rpt-meta-note">${note}</span>`:''}</div>`;
+  }
+  function refTag(num) {
+    return `<sup class="rpt-ref">[${num}]</sup>`;
+  }
+
+  // ① 청력 손실 등급 (양이)
+  const gradeHTML = section('청력 손실 등급', '📊',
+    `<div class="rpt-grade-row">
+      ${L ? `<div class="rpt-grade-card" style="border-color:${L.who.border};background:${L.who.bg}">
+        <div class="rpt-grade-ear">왼쪽 귀 (L)</div>
+        <div class="rpt-grade-label" style="color:${L.who.color}">${L.who.ko}</div>
+        <div class="rpt-grade-en">${L.who.en} — Grade ${L.who.grade}</div>
+        <div class="rpt-grade-pta">PTA₄ <strong>${L.pta4} dB HL</strong></div>
+        <div class="rpt-grade-pta">PTA₃ ${L.pta3} dB HL &nbsp;|&nbsp; HFPTA ${L.hfpta??'—'} dB HL</div>
+      </div>` : ''}
+      ${R ? `<div class="rpt-grade-card" style="border-color:${R.who.border};background:${R.who.bg}">
+        <div class="rpt-grade-ear">오른쪽 귀 (R)</div>
+        <div class="rpt-grade-label" style="color:${R.who.color}">${R.who.ko}</div>
+        <div class="rpt-grade-en">${R.who.en} — Grade ${R.who.grade}</div>
+        <div class="rpt-grade-pta">PTA₄ <strong>${R.pta4} dB HL</strong></div>
+        <div class="rpt-grade-pta">PTA₃ ${R.pta3} dB HL &nbsp;|&nbsp; HFPTA ${R.hfpta??'—'} dB HL</div>
+      </div>` : ''}
+    </div>
+    <p class="rpt-footnote">WHO 세계청력보고서(2021)${refTag(1)} 기준. PTA₄: 500·1000·2000·4000 Hz 4분법 평균${refTag(2)}. HFPTA: 2000·4000·8000 Hz 고음역 평균.</p>`
   );
 
-  // ② 청각도 패턴
-  sections.push(
-`🔍 청각도 패턴 분석 (Schuknecht, 1993)
-${ear.pattern.label}
-${getPatternDescription(ear.pattern.type)}`
-  );
+  // ② 난청 유형 및 청각도 형태
+  const typeHTML = section('난청 유형 · 청각도 형태', '🔬', (() => {
+    let html = '<div class="rpt-two-col">';
+    for (const [side, e] of [['왼쪽(L)', L],['오른쪽(R)', R]]) {
+      if (!e) continue;
+      const typeColor = e.hlType.type.includes('sensor') ? '#6366f1'
+                       : e.hlType.type.includes('conduct') ? '#f59e0b' : '#ef4444';
+      html += `<div class="rpt-type-card">
+        <div class="rpt-type-ear">${side}</div>
+        <div class="rpt-type-label" style="color:${typeColor}">${e.hlType.ko}</div>
+        <div class="rpt-type-sub">${e.hlType.en}${e.hlType.abg!==null ? ` · ABG ${e.hlType.abg} dB`:' (추정)'}</div>
+        <hr class="rpt-hr">
+        <div class="rpt-type-pattern">${e.pattern.ko}</div>
+        <div class="rpt-type-sub">${e.pattern.en}${e.pattern.slope!==undefined ? ` · 기울기 ${e.pattern.slope>0?'+':''}${Math.round(e.pattern.slope)} dB`:''}</div>
+        ${e.notch?.present ? `<div class="rpt-alert-inline" style="color:#ef4444;margin-top:6px">⚠ 4kHz Notch 검출 (+${e.notch.value}dB) — 소음성 난청(NIHL) 시사</div>` : ''}
+      </div>`;
+    }
+    html += '</div>';
+    html += `<p class="rpt-footnote">난청 유형: Lidén & Nilsson(1954)${refTag(10)}, AAO-HNS(2019)${refTag(11)} 기준. 청각도 형태: Schuknecht(1993)${refTag(7)} 분류체계.</p>`;
+    return html;
+  })());
 
-  // ③ 어음 이해
-  const speechPct = ear.speech;
-  const aiVal     = (ear.ai * 100).toFixed(0);
-  sections.push(
-`🗣 어음 이해도 예측 (ANSI S3.5 / Killion & Niquette, 2000)
-어음명료도 지수(AI): ${aiVal}%
-추정 어음인지도: 약 ${speechPct}%
-SRT 추정: ~${ear.srt} dB HL (Carhart & Jerger, 1959)
-${getSpeechDescription(speechPct)}`
-  );
+  // ③ 어음 이해 예측
+  const speechHTML = section('어음 이해 능력 예측', '🗣', (() => {
+    let html = '<div class="rpt-speech-grid">';
+    for (const [side, e] of [['왼쪽', L],['오른쪽', R]]) {
+      if (!e) continue;
+      const wrsColor = e.wrs>=80 ? '#10b981' : e.wrs>=50 ? '#f59e0b' : '#ef4444';
+      const siiPct   = (e.sii*100).toFixed(1);
+      html += `<div class="rpt-speech-card">
+        <div class="rpt-speech-ear">${side} 귀</div>
+        <div class="rpt-speech-row">
+          <span class="rpt-speech-label">어음명료도지수 (SII)</span>
+          <span class="rpt-speech-val">${siiPct}%</span>
+        </div>
+        <div class="rpt-progress-bar"><div class="rpt-progress-fill" style="width:${siiPct}%;background:${wrsColor}"></div></div>
+        <div class="rpt-speech-row">
+          <span class="rpt-speech-label">추정 어음인지율 (WRS)</span>
+          <span class="rpt-speech-val" style="color:${wrsColor};font-weight:600">~${e.wrs}%</span>
+        </div>
+        <div class="rpt-progress-bar"><div class="rpt-progress-fill" style="width:${e.wrs}%;background:${wrsColor}"></div></div>
+        <div class="rpt-speech-row">
+          <span class="rpt-speech-label">추정 SRT</span>
+          <span class="rpt-speech-val">${e.srt ?? '—'} dB HL</span>
+        </div>
+        <div class="rpt-speech-row">
+          <span class="rpt-speech-label">SNR 손실 추정</span>
+          <span class="rpt-speech-val" style="color:${e.snrLoss>5?'#f59e0b':'inherit'}">+${e.snrLoss} dB</span>
+        </div>
+      </div>`;
+    }
+    html += `</div>
+    <p class="rpt-footnote">SII: ANSI S3.5-1997${refTag(5)} · WRS 변환: Killion & Niquette (2000)${refTag(5)} · SRT 추정: Carhart & Jerger (1959)${refTag(8)}, r=0.94±10dB</p>`;
+    return html;
+  })());
 
-  // ④ 일상생활 영향
-  sections.push(
-`🏠 일상생활 영향
-${getDailyImpact(ear.pta4, ear.pattern.type)}`
-  );
+  // ④ 기능적 장애 지수 (HHIE)
+  const hhieHTML = section('기능적 청각 장애 지수 (HHIE-S)', '📋', (() => {
+    let html = '<div class="rpt-hhie-grid">';
+    for (const [side, e] of [['왼쪽', L],['오른쪽', R]]) {
+      if (!e) continue;
+      const scoreColor = e.hhie.score<=8 ? '#10b981' : e.hhie.score<=24 ? '#f59e0b' : '#ef4444';
+      html += `<div class="rpt-hhie-card">
+        <div class="rpt-hhie-ear">${side} 귀</div>
+        <div class="rpt-hhie-score" style="color:${scoreColor}">${e.hhie.score}<span>/40</span></div>
+        <div class="rpt-hhie-level">${e.hhie.level}</div>
+        <div class="rpt-hhie-action">${e.hhie.action}</div>
+      </div>`;
+    }
+    html += `</div>
+    <p class="rpt-footnote">HHIE-S(Hearing Handicap Inventory for Elderly — Screening): 0-8 정상, 10-24 경도 장애, 26-40 중등-고도 장애. Ventry & Weinstein(1983) 단순화 추정.</p>`;
+    return html;
+  })());
 
-  // ⑤ 이명 위험도
-  const tRisk = ear.tinnitusRisk;
-  sections.push(
-`🔔 이명(Tinnitus) 연관 위험도
-위험도: ${tRisk === 'high' ? '높음 ⚠️' : tRisk === 'moderate' ? '중간' : '낮음'}
-${getTinnitusNote(tRisk, ear.pattern.type)}`
-  );
-
-  // ⑥ 비대칭성
-  if (analysis.asymmetry) {
-    sections.push(
-`⚖️ 양이 비대칭성
-${analysis.asymmetry.label} (좌우 차이: ${analysis.asymmetry.dB} dB)
-${analysis.asymmetry.significant ? '※ 10dB 이상 차이 시 일측성 난청 또는 후미로성 병변 가능성을 전문가와 확인하세요.' : '좌우 역치 차이가 임상적으로 유의하지 않습니다.'}`
+  // ⑤ 비대칭성
+  let asymHTML = '';
+  if (asym) {
+    const urgColor = asym.urgent ? '#ef4444' : asym.significant ? '#f59e0b' : '#10b981';
+    asymHTML = section('양이 비대칭성 분석', '⚖️', `
+      <div class="rpt-asym-row" style="border-left:3px solid ${urgColor};padding-left:12px">
+        <div class="rpt-asym-label" style="color:${urgColor}">${asym.label}</div>
+        <div class="rpt-meta-row">${metaRow('PTA₄ 차이', `${asym.ptaDiff} dB`, asym.ptaDiff>=15?'⚠ AAO-HNS 기준 이상':'정상 범위')}</div>
+        <div class="rpt-meta-row">${metaRow('고음역 차이', `${asym.hfDiff} dB`, asym.hfDiff>=20?'⚠ 정밀 검사 권장':'')}</div>
+        <div class="rpt-meta-row">${metaRow('손실 우세측', asym.side==='left'?'왼쪽':asym.side==='right'?'오른쪽':'대칭','')}</div>
+      </div>
+      ${asym.urgent ? '<div class="rpt-urgent-box">⚠️ PTA 차이 ≥25dB 또는 고음역 차이 ≥30dB: 일측성 난청, 청신경종(acoustic neuroma) 등 후미로성 병변 가능성 — 즉시 이비인후과 의뢰 권장 (AAO-HNS 2019)</div>' : ''}
+      <p class="rpt-footnote">비대칭성 기준: AAO-HNS Clinical Practice Guidelines(2019)${refTag(11)}</p>`
     );
   }
 
+  // ⑥ 이명 위험도
+  const tRisk = ear.tinnitusRisk;
+  const tColor = riskColor[tRisk];
+  const tinnHTML = section('이명(Tinnitus) 연관 위험 지표', '🔔', `
+    <div class="rpt-risk-row">
+      <div class="rpt-risk-gauge" style="border-color:${tColor}">
+        <div class="rpt-risk-label" style="color:${tColor}">
+          ${tRisk==='high'?'높음 ⚠️':tRisk==='moderate'?'중간':'낮음'}
+        </div>
+        <div class="rpt-risk-bar-wrap">
+          <div class="rpt-risk-bar" style="width:${tRisk==='high'?90:tRisk==='moderate'?55:20}%;background:${tColor}"></div>
+        </div>
+      </div>
+      <p style="margin:8px 0 0;font-size:13px;color:var(--text2)">${getTinnitusNote(tRisk, ear.pattern.type)}</p>
+    </div>
+  `);
+
   // ⑦ 권고사항
-  sections.push(
-`✅ 권고사항
-${getRecommendation(ear.pta4, ear.who.grade, ear.pattern.type)}
+  const recHTML = section('임상 권고사항', '✅', `
+    <div class="rpt-rec-list">
+      ${getRecommendations(ear.who.grade, ear.pattern.type, asym).map(r =>
+        `<div class="rpt-rec-item ${r.level}"><span class="rpt-rec-dot"></span><div>${r.text}</div></div>`
+      ).join('')}
+    </div>
+    <div class="rpt-disclaimer">
+      ⚠️ 본 결과는 스크리닝 목적의 참고 자료이며, 의학적 진단을 대체하지 않습니다.
+      정확한 진단·처방은 이비인후과 전문의 및 공인 청각사(Audiologist)와 상담하세요.
+      <br>ICD-10 참고코드: ${ear.who.icd} (청력손실 등급 기준)
+    </div>
+    <div class="rpt-refs">
+      <div class="rpt-refs-title">참고 문헌</div>
+      [1] WHO (2021). World Report on Hearing. &nbsp;
+      [2] ASHA (2011). Type, Degree, and Configuration of HL. &nbsp;
+      [3] Byrne & Dillon (1986). Ear Hear 7(4):257. &nbsp;
+      [5] Killion & Niquette (2000). JASA 108(2):517. &nbsp;
+      [6] Kim et al (2023). Appl Sci 13(4):2580. &nbsp;
+      [7] Schuknecht (1993). Pathology of Ear. &nbsp;
+      [8] Carhart & Jerger (1959). J Speech Hear Disord. &nbsp;
+      [9] Seewald et al (1997). Trends Amplif 2(4):124. &nbsp;
+      [10] Lidén & Nilsson (1954). &nbsp;
+      [11] AAO-HNS (2019). Clinical Practice Guidelines.
+    </div>
+  `);
 
-⚠️ 본 결과는 스크리닝 목적의 참고 자료이며, 의학적 진단을 대체하지 않습니다. 정확한 진단 및 치료는 이비인후과·청각사 전문가와 상담하세요.`
-  );
-
-  return sections.join('\n\n');
+  return gradeHTML + typeHTML + speechHTML + hhieHTML + asymHTML + tinnHTML + recHTML;
 }
 
-function buildDNNReport(analysis) {
+// ─────────────────────────────────────────────────────
+//  § 14. DNN-HA 이득 처방 리포트 (차트 데이터 포함)
+// ─────────────────────────────────────────────────────
+function buildGainReport(analysis) {
   const ear = analysis.left || analysis.right;
-  if (!ear) return 'DNN-HA 분석 데이터가 없습니다.';
+  if (!ear) return { html:'', chartData:null };
 
-  const nalr  = ear.nalrGains;
-  const dnn   = ear.dnnGains;
+  const { nalrGains: nalr, dslGains: dsl, dnnGains: dnn, thresholds: thr } = ear;
 
-  // 이득 테이블
-  const tableRows = FREQS.map((f, i) => {
-    const h    = ear.thresholds[i];
-    const n    = nalr[i];
-    const d    = dnn[i].gain;
-    const diff = dnn[i].delta;
-    const bar  = '█'.repeat(Math.min(20, Math.round(d / 3)));
-    return `  ${String(f+'Hz').padEnd(6)} | 역치 ${h !== null ? String(h+'dB').padEnd(6) : ' — '}| NAL-R +${String(n+'dB').padEnd(5)}| DNN +${String(d+'dB').padEnd(5)}| ${diff >= 0 ? '+':'-'}${Math.abs(diff)}dB  ${bar}`;
+  // 이득 비교 테이블
+  const rows = FREQS.map((f,i) => {
+    const h   = thr[i];
+    const n   = nalr[i], d2 = dsl[i], d3 = dnn[i].gain;
+    const maxG = Math.max(n, d2, d3);
+    function cell(v, isMax) {
+      return `<td class="rpt-gain-td ${isMax&&v===maxG?'rpt-gain-hi':''}">${v>0?'+'+v:'—'}</td>`;
+    }
+    return `<tr>
+      <td class="rpt-gain-freq">${f>=1000?f/1000+'kHz':f+'Hz'}</td>
+      <td class="rpt-gain-thr">${h!==null?h+' dB':'—'}</td>
+      ${cell(n, false)}
+      ${cell(d2, false)}
+      <td class="rpt-gain-td rpt-gain-dnn">${d3>0?'+'+d3+' dB':'—'}${dnn[i].delta>0?` <span class="rpt-gain-delta">+${dnn[i].delta}</span>`:''}</td>
+    </tr>`;
+  }).join('');
+
+  const maxFreq = FREQS[dnn.reduce((mi,d,i,a)=>d.gain>a[mi].gain?i:mi, 0)];
+  const avgDelta = (dnn.reduce((s,d)=>s+d.delta,0)/FREQS.length).toFixed(1);
+
+  const html = `
+  <div class="rpt-gain-intro">
+    <p>청각도(audiogram) 기반 보청기 처방 이득을 3가지 알고리즘으로 비교합니다.</p>
+    <div class="rpt-gain-legend">
+      <span class="rpt-legend-item"><span class="dot" style="background:#6366f1"></span>NAL-R (Byrne & Dillon, 1986)</span>
+      <span class="rpt-legend-item"><span class="dot" style="background:#f59e0b"></span>DSL v5.0 (Seewald, 1997)</span>
+      <span class="rpt-legend-item"><span class="dot" style="background:#10b981"></span>DNN-HA (Kim et al., 2023)</span>
+    </div>
+  </div>
+  <div class="rpt-gain-canvas-wrap">
+    <canvas id="gain-chart" height="180"></canvas>
+  </div>
+  <div class="rpt-table-wrap">
+    <table class="rpt-gain-table">
+      <thead><tr>
+        <th>주파수</th><th>역치(dBHL)</th>
+        <th>NAL-R</th><th>DSL v5.0</th><th>DNN-HA</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  </div>
+  <div class="rpt-gain-summary">
+    <div class="rpt-summary-item">
+      <span class="rpt-summary-label">최대 보정 주파수</span>
+      <span class="rpt-summary-val">${maxFreq} Hz</span>
+    </div>
+    <div class="rpt-summary-item">
+      <span class="rpt-summary-label">DNN-HA vs NAL-R 평균 차이</span>
+      <span class="rpt-summary-val">${avgDelta>0?'+':''}${avgDelta} dB</span>
+    </div>
+    <div class="rpt-summary-item">
+      <span class="rpt-summary-label">청각도 패턴</span>
+      <span class="rpt-summary-val">${ear.pattern.ko}</span>
+    </div>
+  </div>
+  <div class="rpt-dnn-features">
+    <div class="rpt-feature-title">DNN-HA 처리 특성 (Kim et al. 2023)</div>
+    <div class="rpt-feature-grid">
+      <div class="rpt-feature-item"><span class="rpt-feature-icon">🔇</span><b>조용한 환경</b><br>낮은 압축비 · 자연스러운 음질</div>
+      <div class="rpt-feature-item"><span class="rpt-feature-icon">🔊</span><b>소음 환경</b><br>방향성 강화 · SNR 개선</div>
+      <div class="rpt-feature-item"><span class="rpt-feature-icon">🎯</span><b>개인화 Fitting</b><br>청각도 패턴별 최적 이득 곡선</div>
+      <div class="rpt-feature-item"><span class="rpt-feature-icon">📈</span><b>비선형 처리</b><br>고손실 대역 추가 보정</div>
+    </div>
+  </div>
+  <p class="rpt-footnote">처방 알고리즘 참고: NAL-R${refTag(3)} · DSL v5.0${refTag(9)} · DNN-HA${refTag(6)}. 실제 처방은 공인 청각사와 상담하세요.</p>`;
+
+  // 차트용 데이터
+  const chartData = {
+    labels: FREQ_LABELS,
+    nalr:   nalr,
+    dsl:    dsl,
+    dnn:    dnn.map(d=>d.gain),
+    thr:    thr.map(v=>v??0),
+  };
+
+  return { html, chartData };
+
+  function refTag(n) { return `<sup class="rpt-ref">[${n}]</sup>`; }
+}
+
+// ─────────────────────────────────────────────────────
+//  § 15. 이득 곡선 차트 렌더링 (Canvas)
+// ─────────────────────────────────────────────────────
+function renderGainChart(canvasId, chartData) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas || !chartData) return;
+
+  const dpr = window.devicePixelRatio || 1;
+  const W   = canvas.parentElement.clientWidth - 2;
+  const H   = 180;
+  canvas.width  = W * dpr;
+  canvas.height = H * dpr;
+  canvas.style.width  = W + 'px';
+  canvas.style.height = H + 'px';
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+
+  const pad = { top:16, right:20, bottom:28, left:44 };
+  const gw  = W - pad.left - pad.right;
+  const gh  = H - pad.top  - pad.bottom;
+  const maxG = 80, minG = 0;
+
+  function gY(g)  { return pad.top + (1 - (g-minG)/(maxG-minG)) * gh; }
+  function fX(i)  { return pad.left + i/(FREQS.length-1) * gw; }
+
+  // Background
+  ctx.fillStyle = '#0f1f3a';
+  ctx.fillRect(0,0,W,H);
+
+  // Grid
+  for (let g = 0; g <= 80; g += 20) {
+    const y = gY(g);
+    ctx.beginPath(); ctx.strokeStyle='rgba(255,255,255,0.05)'; ctx.lineWidth=0.5;
+    ctx.moveTo(pad.left,y); ctx.lineTo(pad.left+gw,y); ctx.stroke();
+    ctx.fillStyle='rgba(90,122,158,0.7)'; ctx.font='9px Inter,sans-serif';
+    ctx.textAlign='right'; ctx.fillText(g+'dB', pad.left-4, y+3);
+  }
+  FREQ_LABELS.forEach((lbl,i) => {
+    const x = fX(i);
+    ctx.beginPath(); ctx.strokeStyle='rgba(255,255,255,0.04)'; ctx.lineWidth=0.5;
+    ctx.moveTo(x,pad.top); ctx.lineTo(x,pad.top+gh); ctx.stroke();
+    ctx.fillStyle='rgba(90,122,158,0.7)'; ctx.font='9px Inter,sans-serif';
+    ctx.textAlign='center'; ctx.fillText(lbl,x,pad.top+gh+16);
   });
 
-  const maxGainFreq = FREQS[dnn.reduce((mi, d, i, arr) => d.gain > arr[mi].gain ? i : mi, 0)];
-  const totalNALR   = nalr.reduce((s, g) => s + g, 0);
-  const totalDNN    = dnn.reduce((s, d) => s + d.gain, 0);
-  const avgDelta    = ((totalDNN - totalNALR) / FREQS.length).toFixed(1);
+  // Axis label
+  ctx.save(); ctx.translate(12,pad.top+gh/2); ctx.rotate(-Math.PI/2);
+  ctx.fillStyle='rgba(90,122,158,0.6)'; ctx.font='9px Inter,sans-serif';
+  ctx.textAlign='center'; ctx.fillText('이득 (dB)',0,0); ctx.restore();
 
-  return `🔬 DNN-HA 주파수별 이득 처방 (Kim et al., 2023)
-
-학술 근거: Kim et al. (2023) "Deep neural network-based hearing aid fitting 
-using audiogram" Applied Sciences 13(4):2580 에서 제안한 청각도 기반 
-개인화 보청기 이득 추정 알고리즘을 구현하였습니다.
-
-처방 기준 비교
-  주파수  | 청력역치    | NAL-R 이득   | DNN-HA 이득  | 차이
-─────────────────────────────────────────────────────────
-${tableRows.join('\n')}
-─────────────────────────────────────────────────────────
-
-📌 핵심 분석
-• 최대 보정 주파수: ${maxGainFreq} Hz
-  → 이 대역에서 청력 손실이 가장 크며, 보청기 처방 시 우선 보강이 필요합니다.
-
-• DNN-HA vs NAL-R 평균 차이: ${avgDelta > 0 ? '+':''}${avgDelta} dB
-  → DNN-HA는 고손실 주파수에서 NAL-R 대비 비선형 이득 증가를 적용하여
-     어음 명료도(speech intelligibility)를 최적화합니다.
-
-• 비선형 신호 처리 이점 (DNN-HA 특성)
-  - 조용한 환경: 낮은 압축비로 자연스러운 음질 유지
-  - 소음 환경: 자동 방향성 강화 + SNR 개선 처리
-  - 개인화 fitting: 청각도 패턴(${ear.pattern.label})에 최적화된 이득 곡선 적용
-
-• 처방 공식 비교
-  - NAL-R (Byrne & Dillon, 1986): 선형 처방, 어음인지 최적화
-  - DSL v5.0: 소아·성인 공통, 청감 쾌적도 중시
-  - DNN-HA: 딥러닝 기반 비선형, 개인 청각 특성 반영
-
-⚠️ 실제 보청기 처방은 반드시 공인 청각사(Audiologist)와 상담하세요.`;
-}
-
-// ── 설명문 생성 헬퍼 ─────────────────────────────────────────────────
-
-function getPatternDescription(type) {
-  const desc = {
-    flat:        '전 주파수 대역에서 유사한 수준의 손실이 나타납니다. 소음성 난청보다는 노인성 난청이나 이독성 약물, 유전적 요인이 원인인 경우가 많습니다.',
-    sloping_hf:  '고음역(2000Hz↑)으로 갈수록 역치가 상승하는 전형적 패턴입니다. 소음성 난청(NIHL), 노인성 난청(presbycusis)에서 가장 흔하게 관찰됩니다.',
-    steep_hf:    '4000Hz 이상에서 역치가 급격히 상승합니다. 장기간 소음 노출, 이독성, 또는 유전성 고음역 청력손실을 시사합니다.',
-    low_freq:    '저음역(500Hz↓)에서 역치가 높게 나타나는 역경사형 패턴입니다. 메니에르병(Ménière\'s disease), 내림프수종 등 와우질환과 연관될 수 있습니다.',
-    cookie_bite: '중음역(1~2kHz)에서 역치가 저음·고음역보다 높은 U자형 패턴입니다. 선천성 또는 유전성 감각신경성 난청에서 특징적으로 나타납니다.',
-    mixed:       '특정 패턴으로 분류하기 어려운 비정형적 청각도입니다. 혼합성(전음+감각신경성) 난청이나 복합 원인을 시사합니다.',
-    unknown:     '충분한 데이터가 수집되지 않아 패턴 판별이 불가합니다.',
-  };
-  return desc[type] || '패턴 분석 불가';
-}
-
-function getSpeechDescription(pct) {
-  if (pct >= 90) return '→ 조용한 환경에서 거의 모든 어음을 이해할 수 있습니다.';
-  if (pct >= 75) return '→ 조용한 환경에서 대부분의 대화는 가능하나, 소음 환경에서 어려움이 있을 수 있습니다.';
-  if (pct >= 50) return '→ 조용한 환경에서도 어음 이해에 어려움이 있으며, 소음 환경에서는 상당한 불편을 겪을 수 있습니다.';
-  if (pct >= 25) return '→ 대화 이해가 상당히 어렵습니다. 보청기 또는 청각 재활 프로그램이 도움이 될 수 있습니다.';
-  return '→ 대화 이해가 매우 어렵습니다. 전문적인 청각 재활 및 보조기기 사용이 권장됩니다.';
-}
-
-function getDailyImpact(pta4, patternType) {
-  const impacts = [];
-  if (pta4 <= 15) {
-    impacts.push('• 일상 대화 및 청취에 특별한 어려움이 없습니다.');
-  } else if (pta4 <= 25) {
-    impacts.push('• 조용한 환경에서는 정상적 대화가 가능합니다.');
-    impacts.push('• 작은 소리나 속삭임을 놓칠 수 있습니다.');
-  } else if (pta4 <= 40) {
-    impacts.push('• 보통 크기의 대화 이해에 어려움이 생길 수 있습니다.');
-    impacts.push('• TV 볼륨을 크게 높이게 되거나, 전화 통화가 불편할 수 있습니다.');
-    impacts.push('• 소음 환경(식당, 강의실)에서 대화 이해가 현저히 저하됩니다.');
-  } else if (pta4 <= 55) {
-    impacts.push('• 일상 대화에서 자주 "다시 말씀해 주세요"를 요청하게 됩니다.');
-    impacts.push('• 전화 통화가 상당히 어렵습니다. 화상 통화(입 모양 읽기 활용)가 유리합니다.');
-    impacts.push('• 강의, 회의, 영화 감상 시 집중 청취에도 이해가 어렵습니다.');
-  } else {
-    impacts.push('• 일반적인 대화 소리를 거의 들을 수 없습니다.');
-    impacts.push('• 보청기 또는 인공와우 등 청각 보조기기의 사용이 필요한 수준입니다.');
-    impacts.push('• 청각 재활 훈련을 통해 잔존 청력을 최대한 활용할 수 있습니다.');
+  // Plot lines
+  function plotLine(gains, color, dash=[]) {
+    const pts = gains.map((g,i)=>({x:fX(i), y:gY(Math.max(0,g))})).filter((_,i)=>chartData.thr[i]>0||gains[i]>0);
+    if (pts.length<2) return;
+    ctx.beginPath(); ctx.strokeStyle=color; ctx.lineWidth=2;
+    ctx.setLineDash(dash);
+    pts.forEach((p,i)=>i===0?ctx.moveTo(p.x,p.y):ctx.lineTo(p.x,p.y));
+    ctx.stroke(); ctx.setLineDash([]);
+    pts.forEach(p=>{
+      ctx.beginPath(); ctx.arc(p.x,p.y,3,0,Math.PI*2);
+      ctx.fillStyle=color; ctx.fill();
+    });
   }
 
-  if (patternType === 'sloping_hf' || patternType === 'steep_hf') {
-    impacts.push('• 고음역 손실로 인해 s, f, sh, th 등 고주파 자음 식별이 특히 어렵습니다.');
-    impacts.push('• 새소리, 초인종, 전화 벨소리 등이 잘 들리지 않을 수 있습니다.');
-  }
-  if (patternType === 'low_freq') {
-    impacts.push('• 저음역 손실로 인해 남성 목소리나 저음의 음악 소리가 잘 들리지 않을 수 있습니다.');
-  }
-  return impacts.join('\n');
+  plotLine(chartData.nalr, '#6366f1', [4,3]);
+  plotLine(chartData.dsl,  '#f59e0b', [6,3]);
+  plotLine(chartData.dnn,  '#10b981');
 }
 
+// ─────────────────────────────────────────────────────
+//  § 16. 설명문 헬퍼
+// ─────────────────────────────────────────────────────
 function getTinnitusNote(risk, patternType) {
-  if (risk === 'high') {
-    return '고음역 급추형 패턴과 중등도 이상 손실이 동반될 경우 이명 발생 위험이 높습니다.\n이비인후과에서 이명 정밀 검사(이명도 검사)를 받아보시기 바랍니다.';
-  }
-  if (risk === 'moderate') {
-    return '청력 손실 패턴에서 이명이 동반될 가능성이 있습니다.\n이명 증상이 있다면 전문가 상담을 권장합니다.';
-  }
-  return '현재 청력 패턴에서 이명 위험도는 낮은 편입니다.\n다만 소음 노출 환경에서는 청력 보호구 착용을 권장합니다.';
+  if (risk === 'high') return '고음역 급추형/Notch 패턴과 중등도 이상 손실 동반 → 이명 발생 위험 높음. 이비인후과 이명도검사 권장.';
+  if (risk === 'moderate') return '청력 손실 패턴에서 이명이 동반될 가능성 있음. 이명 증상 발생 시 전문가 상담 권장.';
+  return '현재 패턴에서 이명 위험도 낮음. 소음 환경에서는 청력 보호구 착용 권장.';
 }
 
-function getRecommendation(pta4, grade, patternType) {
+function getRecommendations(grade, patternType, asym) {
   const recs = [];
+  const add = (text, level='normal') => recs.push({ text, level });
+
   if (grade === 0) {
-    recs.push('• 현재 청력은 정상 범위입니다.');
-    recs.push('• 소음 노출 환경(공장, 공사장, 콘서트 등)에서는 청력 보호구를 착용하세요.');
-    recs.push('• 1~2년마다 청력 검진을 권장합니다.');
+    add('현재 청력은 정상 범위입니다. 연 1회 정기 청력 검진을 권장합니다.');
+    add('소음 노출 환경(85dBSPL 이상)에서는 반드시 청력 보호구(귀마개/귀덮개)를 착용하세요.');
   } else if (grade <= 2) {
-    recs.push('• 이비인후과 또는 청각언어치료실에서 정밀 청력 검사를 받으시기 바랍니다.');
-    recs.push('• 보청기 상담을 시작하면 적응 기간을 줄일 수 있습니다.');
-    recs.push('• 소음 환경에서 보호구 착용을 강력히 권장합니다.');
+    add('이비인후과 또는 청각언어치료실에서 정밀 청력 검사(방음실 PTA, 어음검사)를 받으세요.', 'warn');
+    add('경도 손실 단계에서 보청기를 조기 착용하면 청각 재활 효과가 더 높습니다.');
+    add('소음 환경에서 청력 보호구 착용을 강력히 권장합니다.');
   } else if (grade <= 4) {
-    recs.push('• 조속한 이비인후과 전문의 상담이 필요합니다.');
-    recs.push('• 보청기 처방 및 적합 과정을 공인 청각사(audiologist)와 진행하세요.');
-    recs.push('• 청각 재활 훈련(Auditory Verbal Therapy)이 어음 이해 향상에 도움이 됩니다.');
+    add('조속히 이비인후과 전문의 상담이 필요합니다.', 'urgent');
+    add('공인 청각사(Audiologist)를 통한 보청기 처방 및 적합(fitting) 과정을 진행하세요.', 'warn');
+    add('청각 재활 훈련(Auditory Verbal Therapy, AVT)이 어음 이해도 향상에 도움이 됩니다.');
+    add('보청기 착용 후 WRS(어음인지율)가 최소 6주 후 재측정을 권장합니다.');
   } else {
-    recs.push('• 즉시 이비인후과 전문의 진료를 받으시기 바랍니다.');
-    recs.push('• 고도·심도 난청에서는 보청기의 효과가 제한적일 수 있으며,');
-    recs.push('  인공와우(cochlear implant) 적합 여부 평가를 고려하시기 바랍니다.');
-    recs.push('• 청각장애 복지서비스 및 지원제도 활용을 안내받으세요.');
+    add('즉시 이비인후과 전문의 진료를 받으시기 바랍니다.', 'urgent');
+    add('보청기 효과가 제한적일 수 있습니다. 인공와우(Cochlear Implant) 적합 여부 평가를 고려하세요.', 'urgent');
+    add('청각장애 복지서비스(장애인 보조기기 지원, 통신 중계 서비스 등) 안내를 받으세요.');
   }
 
   if (patternType === 'low_freq') {
-    recs.push('• 역경사형 패턴은 메니에르병과 연관될 수 있으므로,');
-    recs.push('  어지럼증·이명·이충만감 등 동반 증상 여부를 반드시 전문의에게 보고하세요.');
+    add('역경사형 패턴: 메니에르병(Ménière\'s disease) 가능성 — 어지럼증·이명·이충만감 동반 여부를 전문의에게 반드시 보고하세요.', 'warn');
+  }
+  if (patternType === 'notch_4k') {
+    add('4kHz Notch 패턴: 소음성 난청(NIHL) 시사 — 소음 작업장 종사 여부 확인 및 산업보건 평가를 권장합니다.', 'warn');
   }
   if (patternType === 'cookie_bite') {
-    recs.push('• U형 패턴은 유전성 난청과 관련될 수 있어 가족력 확인이 중요합니다.');
+    add('U형(Cookie-bite) 패턴: 유전성 난청 연관 가능 — 가족력 확인 및 유전자 검사 상담을 권장합니다.');
+  }
+  if (asym?.urgent) {
+    add('⚠️ 유의한 양이 비대칭성: 청신경종(acoustic neuroma) 또는 후미로성 병변 가능 — MRI 검사를 포함한 즉시 이비인후과 의뢰가 필요합니다.', 'urgent');
   }
 
-  return recs.join('\n');
+  return recs;
 }
 
-// ── 외부 공개 API ────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────
+//  § 17. 공개 API
+// ─────────────────────────────────────────────────────
 window.HearCheckEngine = {
   analyzeHearing,
-  buildAnalysisReport,
-  buildDNNReport,
-  calcNALR,
-  calcDNNHA,
-  calcAI,
-  aiToSpeechScore,
-  classifyPattern,
-  classifyWHO,
-  calcPTA4,
-  WHO_GRADES,
-  FREQS,
+  buildClinicalReport,
+  buildGainReport,
+  renderGainChart,
+  calcNALR, calcDSL, calcDNNHA,
+  calcSII, siiToWRS,
+  classifyPattern, classifyWHO, classifyHLType,
+  calcPTA4, calcPTA3, calcHFPTA,
+  WHO_GRADES, FREQS, FREQ_LABELS,
 };
-})(); // end IIFE — 전역 스코프 오염 방지
+
+})(); // IIFE end

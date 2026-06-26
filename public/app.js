@@ -336,7 +336,7 @@ function drawAudiogram() {
   });
 }
 
-// ── AI Page (오프라인 엔진) ───────────────────────────
+// ── AI Page (오프라인 엔진 v2.0) ─────────────────────
 function initAIPage() {
   FREQS.forEach((_, i) => {
     const el = document.getElementById('fslider-' + i);
@@ -361,48 +361,54 @@ function applyTestToSliders() {
   });
 }
 
-// ── 오프라인 분석 실행 (API 불필요) ─────────────────────
 function runAnalysis() {
   const E = window.HearCheckEngine;
-  if (!E) { alert('분석 엔진 로드 실패. 페이지를 새로고침 해주세요.'); return; }
+  if (!E) { alert('분석 엔진 로드 실패. 새로고침 해주세요.'); return; }
 
-  const leftThr  = getAudiogramFromSliders();
-  const rightThr = state.thresholds.right.some(v => v !== null)
-    ? state.thresholds.right
-    : Array(9).fill(null);
+  const leftAC  = getAudiogramFromSliders();
+  const rightAC = state.thresholds.right.some(v => v !== null)
+    ? state.thresholds.right : null;
 
-  // 로딩 표시
+  // 로딩
   const aiOut  = document.getElementById('ai-output');
   const dnnOut = document.getElementById('dnn-output');
-  aiOut.className  = 'ai-output loading';
-  aiOut.innerHTML  = '<span class="spinner"></span>청각 분석 중... (학술 알고리즘 처리)';
-  dnnOut.innerHTML = '<span class="spinner"></span>DNN-HA 보정 계산 중...';
+  aiOut.className  = 'ai-output report-mode';
+  aiOut.innerHTML  = '<div style="padding:20px;text-align:center;color:var(--text3)"><span class="spinner"></span>&nbsp; 임상 분석 알고리즘 처리 중...</div>';
+  dnnOut.innerHTML = '<div style="padding:20px;text-align:center;color:var(--text3)"><span class="spinner"></span>&nbsp; 이득 처방 계산 중...</div>';
 
-  // 약간의 딜레이 후 결과 렌더 (UX)
   setTimeout(() => {
     try {
-      const analysis = E.analyzeHearing(leftThr, rightThr);
-      const report   = E.buildAnalysisReport(analysis);
-      const dnnRep   = E.buildDNNReport(analysis);
+      const analysis = E.analyzeHearing(leftAC, rightAC, null, null);
 
-      aiOut.className = 'ai-output';
-      aiOut.textContent = report;
-      dnnOut.textContent = dnnRep;
+      // ── 임상 분석 리포트
+      aiOut.innerHTML = E.buildClinicalReport(analysis);
 
-      // 결과 탭의 진단 카드도 업데이트
+      // ── DNN-HA 이득 처방 리포트
+      const gainResult = E.buildGainReport(analysis);
+      dnnOut.innerHTML = gainResult.html;
+
+      // 차트 렌더 (DOM 삽입 후 약간의 지연)
+      setTimeout(() => {
+        E.renderGainChart('gain-chart', gainResult.chartData);
+      }, 100);
+
+      // 결과 탭 메트릭 업데이트
       const ear = analysis.left || analysis.right;
       if (ear) {
         const dxEl = document.getElementById('dx-card');
-        dxEl.style.cssText = `background:${ear.who.bg};border-color:${ear.who.border};color:${ear.who.color};border-radius:var(--radius);padding:14px 16px;margin-bottom:12px;border:0.5px solid`;
-        document.getElementById('dx-title').textContent = `스크리닝 결과: ${ear.who.label} (WHO Grade ${ear.who.grade})`;
-        document.getElementById('dx-sub').textContent = `PTA₄ ${ear.pta4} dB HL · AI지수 ${(ear.ai * 100).toFixed(0)}% · 어음인지도 ~${ear.speech}%`;
+        if (dxEl) {
+          dxEl.style.cssText = `background:${ear.who.bg};border-color:${ear.who.border};color:${ear.who.color};border-radius:var(--radius);padding:14px 16px;margin-bottom:12px;border:0.5px solid`;
+          document.getElementById('dx-title').textContent = `스크리닝 결과: ${ear.who.ko} (WHO Grade ${ear.who.grade})`;
+          document.getElementById('dx-sub').textContent   = `PTA₄ ${ear.pta4} dB HL · SII ${(ear.sii*100).toFixed(1)}% · WRS ~${ear.wrs}% · SRT ~${ear.srt??'—'} dB HL`;
+        }
       }
     } catch (e) {
-      aiOut.className = 'ai-output';
-      aiOut.textContent = '분석 중 오류 발생: ' + e.message;
+      aiOut.innerHTML = `<div style="color:#ef4444;padding:16px">분석 오류: ${e.message}</div>`;
+      console.error(e);
     }
-  }, 400);
+  }, 350);
 }
+
 
 // ── PWA Install ───────────────────────────────────────
 let deferredPrompt = null;
